@@ -1,6 +1,3 @@
-//go:build integration
-// +build integration
-
 package kafka
 
 import (
@@ -9,59 +6,41 @@ import (
 	"math/rand"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/IBM/sarama"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/kafka"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
-type Container struct {
-	wg           sync.WaitGroup
-	mu           sync.Mutex
-	sentMessages map[string]struct{}
+type kafkaTestSuite struct {
+	suite.Suite
+	container testcontainers.Container
+	cli       *ClientImpl
 }
 
-func (c *Container) Add(msg string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.sentMessages[msg] = struct{}{}
+func TestKafkaTestSuite(t *testing.T) {
+	suite.Run(t, new(kafkaTestSuite))
 }
 
-func (c *Container) Delete(msg string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.sentMessages, msg)
-	c.wg.Done()
-}
-
-func (c *Container) Wait() {
-	c.wg.Wait()
-}
-
-func WaitContainer(expectCount int) *Container {
-	cnt := &Container{sentMessages: make(map[string]struct{})}
-	cnt.wg.Add(expectCount)
-	return cnt
-}
-
-func TestSyncProducer(t *testing.T) {
+func (s *kafkaTestSuite) TestSyncProducer() {
 	var (
-		topic       = generateTopic(16)
+		t           = s.T()
+		topic       = generate(16)
+		group       = generate(16)
 		value       = "test_value"
 		threadCount = 4
 		msgCount    = 1000
 		msgSum      = msgCount * threadCount
 		msgSent     = atomic.NewInt32(0)
 		msgConsumed = atomic.NewInt32(0)
-		cnt         = WaitContainer(msgSum)
+		cnt         = waitContainer(msgSum)
 	)
 
-	client, err := kafkaCli()
-	assert.NoError(t, err)
-
-	producer, err := client.SyncProducer(topic)
+	producer, err := s.cli.SyncProducer(topic)
 	assert.NoError(t, err)
 	defer producer.Close()
 
@@ -78,7 +57,7 @@ func TestSyncProducer(t *testing.T) {
 		}(i)
 	}
 
-	consumer := client.ConsumerGroup("test_group_1")
+	consumer := s.cli.ConsumerGroup(group)
 	defer consumer.Close()
 
 	err = consumer.ConsumeFunc(context.Background(), []string{topic}, func(_ context.Context, message *sarama.ConsumerMessage) error {
@@ -98,9 +77,11 @@ func TestSyncProducer(t *testing.T) {
 	assert.Equal(t, msgSent, msgConsumed)
 }
 
-func TestWithResetOffset(t *testing.T) {
+func (s *kafkaTestSuite) TestWithResetOffset() {
 	var (
-		topic       = generateTopic(16)
+		t           = s.T()
+		topic       = generate(16)
+		group       = generate(16)
 		value       = "test_value"
 		threadCount = 4
 		msgCount    = 1000
@@ -108,34 +89,30 @@ func TestWithResetOffset(t *testing.T) {
 		msgSum      = msgCount * threadCount
 		msgSent     = atomic.NewInt32(0)
 		msgConsumed = atomic.NewInt32(0)
-		cnt         = WaitContainer(msgSum - int(resetOffset))
+		cnt         = waitContainer(msgSum - int(resetOffset))
 	)
 
-	client, err := kafkaCli()
-	assert.NoError(t, err)
-
-	producer, err := client.SyncProducer(topic)
+	producer, err := s.cli.SyncProducer(topic)
 	assert.NoError(t, err)
 	defer producer.Close()
 
 	for i := 1; i <= threadCount; i++ {
-		go func(i int) {
-			for j := 0; j < msgCount; j++ {
-				v := fmt.Sprintf("sync_%s_%d_%d", value, i, j)
+		for j := 0; j < msgCount; j++ {
+			v := fmt.Sprintf("sync_%s_%d_%d", value, i, j)
+			cnt.Add(v)
+			go func(i, j int) {
 				msg, err := producer.Produce(sarama.StringEncoder(v))
 				assert.NoError(t, err)
 				assert.NotNil(t, msg)
 				msgSent.Inc()
-				cnt.Add(v)
-			}
-		}(i)
+			}(i, j)
+		}
 	}
 
-	consumer := client.ConsumerGroup("test_group_1")
+	consumer := s.cli.ConsumerGroup(group)
 	defer consumer.Close()
 
 	err = consumer.ConsumeFunc(context.Background(), []string{topic}, func(_ context.Context, message *sarama.ConsumerMessage) error {
-		fmt.Println("consume", message.Offset)
 		msgConsumed.Inc()
 		cnt.Delete(string(message.Value))
 		return nil
@@ -152,22 +129,21 @@ func TestWithResetOffset(t *testing.T) {
 	assert.Equal(t, msgSent.Load()-int32(resetOffset), msgConsumed.Load())
 }
 
-func TestAsyncProducerCh(t *testing.T) {
+func (s *kafkaTestSuite) TestAsyncProducerCh() {
 	var (
-		topic       = generateTopic(16)
+		t           = s.T()
+		topic       = generate(16)
+		group       = generate(16)
 		value       = "test_value"
 		threadCount = 4
 		msgCount    = 1000
 		msgSum      = msgCount * threadCount
 		msgSent     = atomic.NewInt32(0)
 		msgConsumed = atomic.NewInt32(0)
-		cnt         = WaitContainer(msgSum)
+		cnt         = waitContainer(msgSum)
 	)
 
-	client, err := kafkaCli()
-	assert.NoError(t, err)
-
-	producer, err := client.AsyncProducer(topic)
+	producer, err := s.cli.AsyncProducer(topic)
 	assert.NoError(t, err)
 	defer producer.Close()
 
@@ -189,7 +165,7 @@ func TestAsyncProducerCh(t *testing.T) {
 		}(i)
 	}
 
-	consumer := client.ConsumerGroup("test_group_1")
+	consumer := s.cli.ConsumerGroup(group)
 	defer consumer.Close()
 
 	err = consumer.ConsumeFunc(context.Background(), []string{topic}, func(_ context.Context, message *sarama.ConsumerMessage) error {
@@ -209,9 +185,11 @@ func TestAsyncProducerCh(t *testing.T) {
 	assert.Equal(t, msgSent, msgConsumed)
 }
 
-func TestAsyncProducer(t *testing.T) {
+func (s *kafkaTestSuite) TestAsyncProducer() {
 	var (
-		topic          = generateTopic(16)
+		t              = s.T()
+		topic          = generate(16)
+		group          = generate(16)
 		value          = "test_value"
 		threadCount    = 4
 		msgCount       = 1000
@@ -220,13 +198,10 @@ func TestAsyncProducer(t *testing.T) {
 		msgSentSuccess = atomic.NewInt32(0)
 		msgSentError   = atomic.NewInt32(0)
 		msgConsumed    = atomic.NewInt32(0)
-		cnt            = WaitContainer(msgSum)
+		cnt            = waitContainer(msgSum)
 	)
 
-	client, err := kafkaCli()
-	assert.NoError(t, err)
-
-	producer, err := client.AsyncProducer(topic)
+	producer, err := s.cli.AsyncProducer(topic)
 	assert.NoError(t, err)
 	defer producer.Close()
 
@@ -259,7 +234,7 @@ func TestAsyncProducer(t *testing.T) {
 		}(i)
 	}
 
-	consumer := client.ConsumerGroup("test_group_1")
+	consumer := s.cli.ConsumerGroup(group)
 	defer consumer.Close()
 
 	err = consumer.ConsumeFunc(context.Background(), []string{topic}, func(_ context.Context, message *sarama.ConsumerMessage) error {
@@ -284,20 +259,71 @@ func TestAsyncProducer(t *testing.T) {
 	assert.Equal(t, msgSent, msgConsumed)
 }
 
-func kafkaCli() (*ClientImpl, error) {
-	return NewClient(zap.NewNop().Sugar(), &Config{
-		KafkaBrokers: []string{"127.0.0.1:9092"},
-		KafkaVersion: "2.8.0",
-	})
+func (s *kafkaTestSuite) SetupSuite() {
+	t := s.T()
+
+	kafkaContainer, err := kafka.Run(t.Context(),
+		"confluentinc/confluent-local:7.5.0",
+		kafka.WithClusterID("test-cluster"),
+	)
+	assert.NoError(t, err)
+
+	brokers, err := kafkaContainer.Brokers(t.Context())
+	assert.NoError(t, err)
+	t.Log(brokers)
+
+	s.cli, err = NewClient(zap.NewNop(), &Config{Brokers: brokers, Version: "2.8.0"})
+	assert.NoError(t, err)
+
+	s.container = kafkaContainer
 }
 
-func generateTopic(n int) string {
+func (s *kafkaTestSuite) TearDownSuite() {
+	if s.cli != nil {
+		assert.NoError(s.T(), s.cli.Close())
+	}
+
+	if s.container != nil {
+		assert.NoError(s.T(), testcontainers.TerminateContainer(s.container))
+	}
+}
+
+type container struct {
+	wg           sync.WaitGroup
+	mu           sync.Mutex
+	sentMessages map[string]struct{}
+}
+
+func (c *container) Add(msg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sentMessages[msg] = struct{}{}
+}
+
+func (c *container) Delete(msg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.sentMessages, msg)
+	c.wg.Done()
+}
+
+func (c *container) Wait() {
+	c.wg.Wait()
+}
+
+func generate(n int) string {
 	var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-	rand.Seed(time.Now().UnixNano())
 
 	b := make([]rune, n)
 	for i := range b {
 		b[i] = letterRunes[rand.Intn(len(letterRunes))]
 	}
+
 	return string(b)
+}
+
+func waitContainer(expectCount int) *container {
+	cnt := &container{sentMessages: make(map[string]struct{})}
+	cnt.wg.Add(expectCount)
+	return cnt
 }
